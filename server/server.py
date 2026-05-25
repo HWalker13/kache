@@ -1,3 +1,5 @@
+import argparse
+import collections
 import os
 import socket
 import threading
@@ -7,8 +9,14 @@ store = {}
 expiry = {}  # key -> unix timestamp (float) when the key dies
 store_lock = threading.Lock()
 
+MODE = "standalone"  # set once in main() before threads start
+
 AOF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "aof.log")
 aof_lock = threading.Lock()
+
+write_queue = collections.deque()
+queue_lock = threading.Lock()
+replication_event = threading.Event()
 
 
 def is_expired(key):
@@ -85,24 +93,31 @@ def handle_command(line):
         if len(args) < 2:
             return "-ERR wrong number of arguments"
         key, value = args[0], args[1]
-        ex_seconds = None
+        abs_ts = None
         if len(args) >= 4 and args[2].upper() == "EX":
             try:
-                ex_seconds = float(args[3])
+                ex_val = float(args[3])
             except ValueError:
                 return "-ERR EX value is not a number"
+            # Values > 1e9 are absolute Unix timestamps (from replication/AOF);
+            # smaller values are relative seconds from a regular client.
+            if ex_val > 1e9:
+                abs_ts = ex_val
+            else:
+                abs_ts = time.time() + ex_val
         with store_lock:
             store[key] = value
-            if ex_seconds is not None:
-                abs_ts = time.time() + ex_seconds
+            if abs_ts is not None:
                 expiry[key] = abs_ts
             else:
-                abs_ts = None
                 expiry.pop(key, None)
-        if abs_ts is not None:
-            append_to_aof(f"SET {key} {value} EX {abs_ts}")
-        else:
-            append_to_aof(f"SET {key} {value}")
+        aof_line = f"SET {key} {value} EX {abs_ts}" if abs_ts is not None else f"SET {key} {value}"
+        if MODE != "replica":
+            append_to_aof(aof_line)
+        if MODE == "primary":
+            with queue_lock:
+                write_queue.append(aof_line)
+            replication_event.set()
         return "+OK"
 
     if cmd == "GET":
@@ -120,7 +135,13 @@ def handle_command(line):
             return "-ERR wrong number of arguments"
         with store_lock:
             _evict(args[0])
-        append_to_aof(f"DELETE {args[0]}")
+        aof_line = f"DELETE {args[0]}"
+        if MODE != "replica":
+            append_to_aof(aof_line)
+        if MODE == "primary":
+            with queue_lock:
+                write_queue.append(aof_line)
+            replication_event.set()
         return "+OK"
 
     if cmd == "EXISTS":
@@ -139,7 +160,12 @@ def handle_command(line):
         with store_lock:
             store.clear()
             expiry.clear()
-        append_to_aof("FLUSH")
+        if MODE != "replica":
+            append_to_aof("FLUSH")
+        if MODE == "primary":
+            with queue_lock:
+                write_queue.append("FLUSH")
+            replication_event.set()
         return "+OK"
 
     if cmd == "KEYS":
@@ -179,23 +205,75 @@ def handle_client(conn, addr):
         print(f"[-] Connection closed: {addr}")
 
 
+def replication_loop(replica_host, replica_port):
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((replica_host, replica_port))
+            rfile = sock.makefile("r")
+            print(f"[repl] Connected to replica at {replica_host}:{replica_port}")
+            replication_event.clear()
+            while True:
+                with queue_lock:
+                    cmd = write_queue[0] if write_queue else None
+                if cmd is not None:
+                    # Send and wait for +OK before removing from queue so the
+                    # command survives a disconnect and gets retried on reconnect.
+                    sock.sendall((cmd + "\n").encode())
+                    response = rfile.readline()
+                    if not response:  # EOF — replica closed the connection
+                        raise ConnectionError("replica disconnected")
+                    with queue_lock:
+                        if write_queue and write_queue[0] == cmd:
+                            write_queue.popleft()
+                else:
+                    replication_event.wait(timeout=1)
+                    replication_event.clear()
+        except Exception as e:
+            print(f"[repl] {e}, reconnecting in 2s...")
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            time.sleep(2)
+
+
 def main():
-    eviction_thread = threading.Thread(target=active_eviction_loop, daemon=True)
-    eviction_thread.start()
+    global MODE
 
-    replay_aof()
-    print(f"[*] Replay complete. {len(store)} key(s) loaded.")
+    parser = argparse.ArgumentParser(description="Kache server")
+    parser.add_argument("--mode", default="standalone",
+                        choices=["standalone", "primary", "replica"])
+    parser.add_argument("--port", type=int, default=6379)
+    parser.add_argument("--replica-host", default="127.0.0.1")
+    parser.add_argument("--replica-port", type=int, default=6380)
+    args = parser.parse_args()
+    MODE = args.mode
 
-    host, port = "0.0.0.0", 6379
+    threading.Thread(target=active_eviction_loop, daemon=True).start()
+
+    if MODE != "replica":
+        replay_aof()
+        print(f"[*] Replay complete. {len(store)} key(s) loaded.")
+
+    if MODE == "primary":
+        threading.Thread(
+            target=replication_loop,
+            args=(args.replica_host, args.replica_port),
+            daemon=True,
+        ).start()
+
+    host, port = "0.0.0.0", args.port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen()
-        print(f"[*] Kache listening on {host}:{port}")
+        print(f"[*] Kache ({MODE}) listening on {host}:{port}")
         while True:
             conn, addr = server.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            t.start()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
 
 if __name__ == "__main__":
