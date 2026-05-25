@@ -1,3 +1,4 @@
+import os
 import socket
 import threading
 import time
@@ -5,6 +6,9 @@ import time
 store = {}
 expiry = {}  # key -> unix timestamp (float) when the key dies
 store_lock = threading.Lock()
+
+AOF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "aof.log")
+aof_lock = threading.Lock()
 
 
 def is_expired(key):
@@ -16,6 +20,47 @@ def _evict(key):
     """Delete key from both dicts. Caller must hold store_lock."""
     store.pop(key, None)
     expiry.pop(key, None)
+
+
+def append_to_aof(line):
+    with aof_lock:
+        with open(AOF_PATH, "a") as f:
+            f.write(line + "\n")
+
+
+def replay_aof():
+    if not os.path.exists(AOF_PATH):
+        return
+    with open(AOF_PATH, "r") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            cmd = parts[0].upper()
+            if cmd == "SET" and len(parts) >= 3:
+                key, value = parts[1], parts[2]
+                if len(parts) >= 5 and parts[3].upper() == "EX":
+                    try:
+                        abs_ts = float(parts[4])
+                    except ValueError:
+                        continue
+                    if time.time() >= abs_ts:
+                        continue  # already expired
+                    with store_lock:
+                        store[key] = value
+                        expiry[key] = abs_ts
+                else:
+                    with store_lock:
+                        store[key] = value
+                        expiry.pop(key, None)
+            elif cmd == "DELETE" and len(parts) >= 2:
+                with store_lock:
+                    _evict(parts[1])
+            elif cmd == "FLUSH":
+                with store_lock:
+                    store.clear()
+                    expiry.clear()
 
 
 def active_eviction_loop():
@@ -49,9 +94,15 @@ def handle_command(line):
         with store_lock:
             store[key] = value
             if ex_seconds is not None:
-                expiry[key] = time.time() + ex_seconds
+                abs_ts = time.time() + ex_seconds
+                expiry[key] = abs_ts
             else:
+                abs_ts = None
                 expiry.pop(key, None)
+        if abs_ts is not None:
+            append_to_aof(f"SET {key} {value} EX {abs_ts}")
+        else:
+            append_to_aof(f"SET {key} {value}")
         return "+OK"
 
     if cmd == "GET":
@@ -69,6 +120,7 @@ def handle_command(line):
             return "-ERR wrong number of arguments"
         with store_lock:
             _evict(args[0])
+        append_to_aof(f"DELETE {args[0]}")
         return "+OK"
 
     if cmd == "EXISTS":
@@ -87,6 +139,7 @@ def handle_command(line):
         with store_lock:
             store.clear()
             expiry.clear()
+        append_to_aof("FLUSH")
         return "+OK"
 
     if cmd == "KEYS":
@@ -129,6 +182,9 @@ def handle_client(conn, addr):
 def main():
     eviction_thread = threading.Thread(target=active_eviction_loop, daemon=True)
     eviction_thread.start()
+
+    replay_aof()
+    print(f"[*] Replay complete. {len(store)} key(s) loaded.")
 
     host, port = "0.0.0.0", 6379
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
