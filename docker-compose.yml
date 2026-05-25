@@ -1,0 +1,20 @@
+services:
+  primary:
+    build: .
+    command: python3 server/server.py --mode primary --replica-host replica --replica-port 6380
+    ports:
+      - "6379:6379"
+    networks:
+      - kache-net
+
+  replica:
+    build: .
+    command: python3 server/server.py --mode replica --port 6380
+    ports:
+      - "6380:6380"
+    networks:
+      - kache-net
+
+networks:
+  kache-net:
+    driver: bridge
