@@ -154,7 +154,7 @@ def handle_command(line):
                     live_keys.append(key)
         if not live_keys:
             return "+none"
-        return "*" + "\n*".join(live_keys)
+        return "*" + "\n*".join(live_keys) + "\n+done"
 
     return f"-ERR unknown command '{cmd}'"
 
