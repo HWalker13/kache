@@ -216,13 +216,6 @@ services:
     ports: ["6380:6380"]
 ```
 
----
-
-## Resume bullet
-
-> Built a Redis-like key-value store from raw TCP sockets in Python, implementing TTL expiry via lazy and active eviction, AOF persistence with absolute-timestamp replay, and a primary-replica replication model with write-ahead queuing for offline replicas. Deployed across two containers on EC2 via Docker Compose.
-
----
 
 ## Built with
 
