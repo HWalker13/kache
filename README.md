@@ -2,7 +2,7 @@
 
 A Redis-like in-memory key-value store built from scratch in Python — raw TCP sockets, no frameworks. Supports TTL expiry, append-only persistence, and primary-replica replication. Deployed on EC2 via Docker Compose.
 
-> **Why "Kache"?** It's a cache. It's also a key-value store. The name is a pun and we're not sorry. (The client class was briefly named `KevoClient`. We're not talking about that.)
+> **Why "Kache"?** It's a cache. It's also a key-value store. Its also just a fun name. (The client class was briefly named `KevoClient`. We're not talking about that.)
 
 ---
 
